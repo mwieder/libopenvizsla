@@ -1,8 +1,10 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
+
 #include <decoder.h>
 
 #include <assert.h>
 
-int packet_decoder_init(struct packet_decoder* pd, struct packet* p, size_t size, packet_decoder_callback callback, void* data) {
+int packet_decoder_init(struct packet_decoder* pd, struct ov_packet* p, size_t size, ov_packet_decoder_callback callback, void* data) {
 	pd->packet = p;
 	pd->buf_actual_length = 0;
 	pd->buf_length = size;
@@ -23,11 +25,12 @@ int packet_decoder_proc(struct packet_decoder* pd, uint8_t* buf, size_t size) {
 				assert(pd->buf_actual_length == 0);
 				assert(pd->buf_length > 0);
 
-				if (*(buf++) != 0xa0) {
+				if (*buf != 0xa0) {
 					pd->error_str = "Wrong packet magic";
 					return -1;
 				}
 
+				pd->packet->magic = *(buf++);
 				pd->state = NEED_PACKET_FLAGS_LO;
 			} break;
 			case NEED_PACKET_FLAGS_LO: {
@@ -35,7 +38,7 @@ int packet_decoder_proc(struct packet_decoder* pd, uint8_t* buf, size_t size) {
 				pd->state = NEED_PACKET_FLAGS_HI;
 			} break;
 			case NEED_PACKET_FLAGS_HI: {
-				pd->packet->flags |= *(buf++) << 8;
+				pd->packet->flags = ov_to_host_16((*(buf++) << 8) | pd->packet->flags);
 				pd->state = NEED_PACKET_LENGTH_LO;
 			} break;
 			case NEED_PACKET_LENGTH_LO: {
@@ -43,7 +46,7 @@ int packet_decoder_proc(struct packet_decoder* pd, uint8_t* buf, size_t size) {
 				pd->state = NEED_PACKET_LENGTH_HI;
 			} break;
 			case NEED_PACKET_LENGTH_HI: {
-				pd->packet->size |= *(buf++) << 8;
+				pd->packet->size = ov_to_host_16((*(buf++) << 8) | pd->packet->size);
 				pd->state = NEED_PACKET_TIMESTAMP_LO;
 
 				// FIXME: check available buffer size
@@ -57,11 +60,11 @@ int packet_decoder_proc(struct packet_decoder* pd, uint8_t* buf, size_t size) {
 				pd->state = NEED_PACKET_TIMESTAMP_HI;
 			} break;
 			case NEED_PACKET_TIMESTAMP_HI: {
-				pd->packet->timestamp |= *(buf++) << 16;
+				pd->packet->timestamp = ov_to_host_24((*(buf++) << 16) | pd->packet->timestamp);
 				pd->state = NEED_PACKET_DATA;
 			} break;
 			case NEED_PACKET_DATA: {
-				const size_t required_length = pd->packet->size - pd->buf_actual_length;
+				const size_t required_length = ov_to_host_16(pd->packet->size) - pd->buf_actual_length;
 				const size_t copy = (required_length < (end - buf) ? required_length : end - buf);
 
 				memcpy(pd->packet->data + pd->buf_actual_length, buf, copy);
@@ -85,7 +88,7 @@ end:
 	return size - (end - buf);
 }
 
-int frame_decoder_init(struct frame_decoder* fd, struct packet* p, size_t size, packet_decoder_callback callback, void* data) {
+int frame_decoder_init(struct frame_decoder* fd, struct ov_packet* p, size_t size, ov_packet_decoder_callback callback, void* data) {
 	if (packet_decoder_init(&fd->pd, p, size, callback, data) < 0)
 		return -1;
 

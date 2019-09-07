@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
+
 #include <cha.h>
 #include <decoder.h>
 
@@ -9,9 +11,12 @@
 #define OV_VENDOR  0x1d50
 #define OV_PRODUCT 0x607c
 
+#define UCFG_REG_ADDRMASK 0x3f
+#define UCFG_REG_GO 0x80
+
 struct cha_loop_packet_callback_state {
 	size_t count;
-	packet_decoder_callback user_callback;
+	ov_packet_decoder_callback user_callback;
 	void* user_data;
 };
 
@@ -75,8 +80,8 @@ fail_ftdi_write_data:
 	return -1;
 }
 
-static int cha_transaction(struct cha* cha, uint16_t addr, uint8_t* val) {
-	uint8_t msg[5] = {0x55, addr >> 8, addr & 0xFF, *val, 0x00};
+static int cha_transaction(struct cha* cha, uint16_t addr, uint8_t in_val, uint8_t* out_val) {
+	uint8_t msg[5] = {0x55, addr >> 8, addr & 0xFF, in_val, 0x00};
 	int ret;
 
 	msg[4] = cha_transaction_checksum(msg, 4);
@@ -99,7 +104,8 @@ static int cha_transaction(struct cha* cha, uint16_t addr, uint8_t* val) {
 		goto fail_transaction_checksum;
 	}
 
-	*val = msg[3];
+	if (out_val)
+		*out_val = msg[3];
 
 	return 0;
 
@@ -139,8 +145,16 @@ fail_ftdi_set_bitmode_reset:
 	return -1;
 }
 
-int cha_init(struct cha* cha) {
+int cha_init(struct cha* cha, struct fwpkg* fwpkg) {
+	int ret = 0;
+
 	memset(cha, 0, sizeof(struct cha));
+
+	ret = reg_init_from_fwpkg(&cha->reg, fwpkg);
+	if (ret < 0) {
+		cha->error_str = reg_get_error_string(&cha->reg);
+		goto fail_reg_init_from_fwpkg;
+	}
 
 	if (ftdi_init(&cha->ftdi) < 0) {
 		cha->error_str = ftdi_get_error_string(&cha->ftdi);
@@ -157,6 +171,8 @@ int cha_init(struct cha* cha) {
 fail_ftdi_set_interface:
 	ftdi_deinit(&cha->ftdi);
 fail_ftdi_init:
+fail_reg_init_from_fwpkg:
+
 	return -1;
 }
 
@@ -204,8 +220,7 @@ int cha_switch_fifo_mode(struct cha* cha) {
 	/* Async FPGA-to-HOST transmission in triggered by SDRAM_HOST_READ_GO.
 	 * Disable it first.
 	 */
-	// FIXME: use loaded register
-	if (cha_sync_stream(cha, 0x8c28) < 0) {
+	if (cha_sync_stream(cha, 0x8000 | cha->reg.addr[SDRAM_HOST_READ_GO]) < 0) {
 		goto fail_cha_sync_stream;
 	}
 
@@ -217,15 +232,15 @@ fail_switch_mode:
 	return -1;
 }
 
-int cha_write_reg(struct cha* cha, uint16_t addr, uint8_t val) {
-	return cha_transaction(cha, addr | 0x8000, &val);
+static int cha_write_reg(struct cha* cha, uint16_t addr, uint8_t val) {
+	return cha_transaction(cha, addr | 0x8000, val, NULL);
 }
 
-int cha_read_reg(struct cha* cha, uint16_t addr, uint8_t* val) {
-	return cha_transaction(cha, addr, val);
+static int cha_read_reg(struct cha* cha, uint16_t addr, uint8_t* val) {
+	return cha_transaction(cha, addr, 0, val);
 }
 
-int cha_write_reg32(struct cha* cha, uint16_t addr, uint32_t val) {
+static int cha_write_reg32(struct cha* cha, uint16_t addr, uint32_t val) {
 	for (uint16_t i = addr + 4; i != addr; --i, val = (val >> 8)) {
 		if (cha_write_reg(cha, i - 1, val & 0xFF) == -1)
 			return -1;
@@ -234,7 +249,7 @@ int cha_write_reg32(struct cha* cha, uint16_t addr, uint32_t val) {
 	return 0;
 }
 
-int cha_read_reg32(struct cha* cha, uint16_t addr, uint32_t* val) {
+static int cha_read_reg32(struct cha* cha, uint16_t addr, uint32_t* val) {
 	uint8_t tmp = 0;
 
 	for (uint16_t i = addr; i != addr + 4; ++i) {
@@ -247,46 +262,148 @@ int cha_read_reg32(struct cha* cha, uint16_t addr, uint32_t* val) {
 	return 0;
 }
 
+int cha_write_reg_by_name(struct cha* cha, enum reg_name name, uint8_t val) {
+	return cha_write_reg(cha, cha->reg.addr[name], val);
+}
+
+int cha_read_reg_by_name(struct cha* cha, enum reg_name name, uint8_t* val) {
+	return cha_read_reg(cha, cha->reg.addr[name], val);
+}
+
+int cha_write_reg32_by_name(struct cha* cha, enum reg_name name, uint32_t val) {
+	return cha_write_reg32(cha, cha->reg.addr[name], val);
+}
+
+int cha_read_reg32_by_name(struct cha* cha, enum reg_name name, uint32_t* val) {
+	return cha_read_reg32(cha, cha->reg.addr[name], val);
+}
+
+int cha_write_ulpi(struct cha* cha, uint8_t addr, uint8_t val) {
+	int ret = 0;
+	uint8_t tmp = 0;
+
+	ret = cha_write_reg_by_name(cha, UCFG_WDATA, val);
+	if (ret == -1)
+		return ret;
+
+	ret = cha_write_reg_by_name(cha, UCFG_WCMD, UCFG_REG_GO | (addr & UCFG_REG_ADDRMASK));
+	if (ret == -1)
+		return ret;
+
+	do {
+		ret = cha_read_reg_by_name(cha, UCFG_WCMD, &tmp);
+		if (ret == -1)
+			return ret;
+	} while(tmp & UCFG_REG_GO);
+
+	return 0;
+}
+
+int cha_read_ulpi(struct cha* cha, uint8_t addr, uint8_t* val) {
+	int ret = 0;
+	uint8_t tmp = 0;
+
+	ret = cha_write_reg_by_name(cha, UCFG_RCMD, UCFG_REG_GO | (addr & UCFG_REG_ADDRMASK));
+	if (ret == -1)
+		return ret;
+
+	do {
+		ret = cha_read_reg_by_name(cha, UCFG_RCMD, &tmp);
+		if (ret == -1)
+			return ret;
+	} while(tmp & UCFG_REG_GO);
+
+	ret = cha_read_reg_by_name(cha, UCFG_RDATA, val);
+	if (ret == -1)
+		return ret;
+
+	return 0;
+}
+
+int cha_get_usb_speed(struct cha* cha, enum ov_usb_speed* speed) {
+	int ret = 0;
+	uint8_t wdata = 0;
+
+	ret = cha_read_ulpi(cha, 0x04, &wdata);
+	if (ret == -1)
+		return ret;
+
+	switch (wdata) {
+	case 0x4a: {
+		*speed = OV_LOW_SPEED;
+	} break;
+	case 0x49: {
+		*speed = OV_FULL_SPEED;
+	} break;
+	case 0x48: {
+		*speed = OV_HIGH_SPEED;
+	} break;
+	default: {
+		cha->error_str = "Invalid USB speed code";
+
+		return -1;
+	} break;
+	}
+
+	return 0;
+}
+
+int cha_set_usb_speed(struct cha* cha, enum ov_usb_speed speed) {
+	int ret = 0;
+	uint8_t wdata = 0;
+
+	switch (speed) {
+	case OV_LOW_SPEED: {
+		wdata = 0x4a;
+	} break;
+	case OV_FULL_SPEED: {
+		wdata = 0x49;
+	} break;
+	case OV_HIGH_SPEED: {
+		wdata = 0x48;
+	} break;
+	}
+
+	// self.regs.ucfg_wdata.wr(value)
+	ret = cha_write_ulpi(cha, 0x04, wdata);
+	if (ret == -1)
+		return ret;
+
+	return 0;
+}
+
 int cha_start_stream(struct cha* cha) {
 	int ret = 0;
 
-	// dev.regs.SDRAM_SINK_RING_BASE.wr(ring_base)
-	ret = cha_write_reg32(cha, 0xe09, 0);
+	ret = cha_write_reg32_by_name(cha, SDRAM_SINK_RING_BASE, 0);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.SDRAM_SINK_RING_END.wr(ring_end)
-	ret = cha_write_reg32(cha, 0xe0d, 0x01000000);
+	ret = cha_write_reg32_by_name(cha, SDRAM_SINK_RING_END, 0x01000000);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.SDRAM_HOST_READ_RING_BASE.wr(ring_base)
-	ret = cha_write_reg32(cha, 0xc1c, 0);
+	ret = cha_write_reg32_by_name(cha, SDRAM_HOST_READ_RING_BASE, 0);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.SDRAM_HOST_READ_RING_END.wr(ring_end)
-	ret = cha_write_reg32(cha, 0xc20, 0x01000000);
+	ret = cha_write_reg32_by_name(cha, SDRAM_HOST_READ_RING_END, 0x01000000);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.SDRAM_SINK_PTR_READ.wr(0)
-	ret = cha_write_reg(cha, 0xe00, 0);
+	ret = cha_write_reg_by_name(cha, SDRAM_SINK_PTR_READ, 0);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.SDRAM_SINK_GO.wr(1)
-	ret = cha_write_reg(cha, 0xe11, 1);
+	ret = cha_write_reg_by_name(cha, SDRAM_SINK_GO, 1);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.SDRAM_HOST_READ_GO.wr(1)
-	ret = cha_write_reg(cha, 0xc28, 1);
+	ret = cha_write_reg_by_name(cha, SDRAM_HOST_READ_GO, 1);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.CSTREAM_CFG.wr(1)
-	ret = cha_write_reg(cha, 0x800, 1);
+	ret = cha_write_reg_by_name(cha, CSTREAM_CFG, 1);
 	if (ret == -1)
 		return ret;
 
@@ -296,28 +413,22 @@ int cha_start_stream(struct cha* cha) {
 int cha_stop_stream(struct cha* cha) {
 	int ret = 0;
 
-	// dev.regs.SDRAM_HOST_READ_GO.wr(0)
-	// FIXME: use loaded register
-	ret = cha_write_reg(cha, 0xc28, 0);
+	ret = cha_write_reg_by_name(cha, SDRAM_HOST_READ_GO, 0);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.SDRAM_SINK_GO.wr(0)
-	// FIXME: use loaded register
-	ret = cha_write_reg(cha, 0xe11, 0);
+	ret = cha_write_reg_by_name(cha, SDRAM_SINK_GO, 0);
 	if (ret == -1)
 		return ret;
 
-	// dev.regs.CSTREAM_CFG.wr(0)
-	// FIXME: use loaded register
-	ret = cha_write_reg(cha, 0x800, 0);
+	ret = cha_write_reg_by_name(cha, CSTREAM_CFG, 0);
 	if (ret == -1)
 		return ret;
 
 	return 0;
 }
 
-static void cha_loop_packet_callback(struct packet* packet, void* data) {
+static void cha_loop_packet_callback(struct ov_packet* packet, void* data) {
 	struct cha_loop* loop = (struct cha_loop*)data;
 
 	if (loop->max_count > 0)
@@ -333,21 +444,6 @@ static void cha_loop_free_transfer(struct libusb_transfer* transfer) {
 	loop->complete = 1;
 }
 
-static void cha_loop_cancel_transfer(struct libusb_transfer* transfer) {
-	struct cha_loop* loop = (struct cha_loop*)transfer->user_data;
-	struct cha* cha = loop->cha;
-
-	int ret = 0;
-
-	if ((ret = libusb_cancel_transfer(transfer)) < 0) {
-		cha_loop_free_transfer(transfer);
-
-		if (ret != LIBUSB_ERROR_NOT_FOUND) {
-			cha->error_str = libusb_error_name(ret);
-		}
-	}
-}
-
 static void cha_loop_transfer_callback(struct libusb_transfer* transfer) {
 	struct cha_loop* loop = (struct cha_loop*)transfer->user_data;
 	struct cha* cha = loop->cha;
@@ -359,8 +455,6 @@ static void cha_loop_transfer_callback(struct libusb_transfer* transfer) {
 			const int done = (loop->max_count > 0 && loop->count >= loop->max_count);
 
 			if (!(done || loop->break_loop) && (ret = libusb_submit_transfer(transfer)) < 0) {
-				cha_loop_cancel_transfer(transfer);
-
 				if (ret != LIBUSB_ERROR_INTERRUPTED) {
 					cha->error_str = libusb_error_name(ret);
 				}
@@ -381,12 +475,10 @@ static void cha_loop_transfer_callback(struct libusb_transfer* transfer) {
 			}
 
 			if (done || loop->break_loop) {
-				cha_loop_cancel_transfer(transfer);
+				cha_loop_free_transfer(transfer);
 			}
 		} break;
 		case LIBUSB_TRANSFER_CANCELLED: {
-			/* Freeing the transfer before cancellation has
-			 * completed will result in undefined behaviour. */
 			cha_loop_free_transfer(transfer);
 		} break;
 		case LIBUSB_TRANSFER_ERROR:
@@ -395,9 +487,10 @@ static void cha_loop_transfer_callback(struct libusb_transfer* transfer) {
 		case LIBUSB_TRANSFER_NO_DEVICE:
 		case LIBUSB_TRANSFER_OVERFLOW:
 		default: {
-			cha_loop_cancel_transfer(transfer);
-
 			cha->error_str = libusb_error_name(transfer->status);
+			loop->break_loop = 1;
+
+			cha_loop_free_transfer(transfer);
 		} break;
 	}
 }
@@ -426,7 +519,7 @@ fail_decode_ftdi_readbuffer:
 	return -1;
 }
 
-int cha_loop_init(struct cha_loop* loop, struct cha* cha, struct packet* packet, size_t packet_size, packet_decoder_callback callback, void* user_data) {
+int cha_loop_init(struct cha_loop* loop, struct cha* cha, struct ov_packet* packet, size_t packet_size, ov_packet_decoder_callback callback, void* user_data) {
 	loop->cha = cha;
 	loop->callback = callback;
 	loop->user_data = user_data;
@@ -494,6 +587,18 @@ fail_libusb_submit_transfer:
 fail_libusb_alloc_transfer:
 fail_read_from_ftdi:
 	return -1;
+}
+
+int cha_set_reg(struct cha* cha, struct reg* reg) {
+	int ret = 0;
+
+	ret = reg_init_from_reg(&cha->reg, reg);
+	if (ret < 0) {
+		cha->error_str = reg_get_error_string(&cha->reg);
+		return -1;
+	}
+
+	return 0;
 }
 
 void cha_destroy(struct cha* cha) {

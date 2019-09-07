@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
+
 #include <fwpkg.h>
 
 #include <stdlib.h>
@@ -70,21 +72,15 @@ static int fwpkg_locate_files(struct fwpkg* fwpkg) {
 	return 0;
 }
 
-struct fwpkg* fwpkg_new() {
-	struct fwpkg* fwpkg = malloc(sizeof(struct fwpkg));
-
-	if (!fwpkg) {
-		return NULL;
-	}
-
-	memset(fwpkg, 0, sizeof(struct fwpkg));
-
-	return fwpkg;
+int fwpkg_init(struct fwpkg* fwpkg, const char* filename) {
+	return (filename ? fwpkg_init_from_file(fwpkg, filename) : fwpkg_init_from_preload(fwpkg));
 }
 
-int fwpkg_from_file(struct fwpkg* fwpkg, const char* filename) {
+int fwpkg_init_from_file(struct fwpkg* fwpkg, const char* filename) {
 	zip_error_t ze;
 	int error;
+
+	memset(fwpkg, 0, sizeof(struct fwpkg));
 
 	fwpkg->pkg = zip_open(filename, ZIP_CHECKCONS | ZIP_RDONLY, &error);
 	if (!fwpkg->pkg) {
@@ -96,11 +92,14 @@ int fwpkg_from_file(struct fwpkg* fwpkg, const char* filename) {
 	return fwpkg_locate_files(fwpkg);
 }
 
-int fwpkg_from_preload(struct fwpkg* fwpkg) {
+int fwpkg_init_from_preload(struct fwpkg* fwpkg) {
 	zip_error_t error;
-	zip_source_t *src = zip_source_buffer_create((const void*)_binary_ov3_fwpkg_start,
-		(const void*)_binary_ov3_fwpkg_end - (const void*)_binary_ov3_fwpkg_start, 0, &error);
+	zip_source_t *src = NULL;
 
+	memset(fwpkg, 0, sizeof(struct fwpkg));
+
+	src = zip_source_buffer_create((const void*)_binary_ov3_fwpkg_start,
+		(const void*)_binary_ov3_fwpkg_end - (const void*)_binary_ov3_fwpkg_start, 0, &error);
 	if (!src) {
 		fwpkg->error_str = zip_error_strerror(&error);
 		return -1;
@@ -115,10 +114,8 @@ int fwpkg_from_preload(struct fwpkg* fwpkg) {
 	return fwpkg_locate_files(fwpkg);
 }
 
-void fwpkg_free(struct fwpkg* fwpkg) {
-	if (fwpkg->pkg)
-		zip_discard(fwpkg->pkg);
-	free(fwpkg);
+void fwpkg_destroy(struct fwpkg* fwpkg) {
+	zip_discard(fwpkg->pkg);
 }
 
 const char* fwpkg_get_error_string(struct fwpkg* fwpkg) {
