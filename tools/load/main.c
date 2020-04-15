@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <ov.h>
+#include <openvizsla.h>
 
 int main(int argc, char** argv) {
 	int ret;
@@ -16,6 +16,10 @@ int main(int argc, char** argv) {
 	}
 
 	ov = ov_new(filename);
+	if (!ov) {
+		fprintf(stderr, "%s\n", "Cannot create ov_device handler");
+		return 1;
+	}
 
 	ret = ov_open(ov);
 	if (ret < 0) {
