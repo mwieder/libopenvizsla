@@ -13,13 +13,13 @@ find_package(LibUSB1 REQUIRED)
 find_package(LibFTDI1 REQUIRED)
 find_package(LibZip 1.0 REQUIRED)
 find_package(Check CONFIG NAMES Check check)
-if (NOT TARGET Check::check)
+if (NOT TARGET Check::checkShared)
 	find_package(PkgConfig REQUIRED)
 
 	pkg_search_module(CHECK REQUIRED Check check)
 
-	add_library(Check::check INTERFACE IMPORTED)
-	set_target_properties(Check::check PROPERTIES
+	add_library(Check::checkShared INTERFACE IMPORTED)
+	set_target_properties(Check::checkShared PROPERTIES
 		INTERFACE_LINK_LIBRARIES "${CHECK_LDFLAGS}"
 		INTERFACE_COMPILE_OPTIONS "${CHECK_CFLAGS}")
 endif()
@@ -29,8 +29,8 @@ include_directories ("${CMAKE_CURRENT_BINARY_DIR}")
 
 add_custom_command(OUTPUT ov3.fwpkg.o
 	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-	COMMAND ld -r -b binary -o ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o ov3.fwpkg
-	COMMAND objcopy --rename-section .data=.rodata,contents,readonly ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o
+	COMMAND ${CMAKE_LINKER} -r -z noexecstack -b binary -o ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o ov3.fwpkg
+	COMMAND ${CMAKE_OBJCOPY} --rename-section .data=.rodata,alloc,load,readonly,data,contents ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o
 	MAIN_DEPENDENCY ov3.fwpkg)
 
 find_program(GPERF NAMES gperf)
@@ -60,10 +60,12 @@ target_compile_definitions(openvizsla PUBLIC "_XOPEN_SOURCE;_XOPEN_SOURCE_EXTEND
 
 generate_export_header(openvizsla)
 
-if(NOT WIN32)
-	target_sources(openvizsla PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o)
-else()
+if(WIN32)
 	set(WIN32_RESOURCE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/fwpkg.rc")
+elseif(APPLE)
+	set(RESOURCE_LINK_OPTIONS "-sectcreate;__DATA;__ov3_fwpkg;${CMAKE_CURRENT_SOURCE_DIR}/ov3.fwpkg")
+else()
+	target_sources(openvizsla PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o)
 endif()
 
 get_target_property(OPENVIZSLA_LIBRARY_TYPE openvizsla TYPE)
@@ -73,21 +75,30 @@ if(NOT ${OPENVIZSLA_LIBRARY_TYPE} STREQUAL "STATIC_LIBRARY")
 
 	add_library(openvizsla_static STATIC EXCLUDE_FROM_ALL ${SOURCES})
 	target_link_libraries(openvizsla_static LibZip::zip ${LIBRARIES})
-	set_target_properties(openvizsla_static PROPERTIES
-		ARCHIVE_OUTPUT_NAME openvizsla)
-	target_compile_definitions(openvizsla_static PUBLIC "OPENVIZSLA_STATIC_DEFINE;_XOPEN_SOURCE;_XOPEN_SOURCE_EXTENDED")
-
 	if(NOT WIN32)
-		target_sources(openvizsla_static PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o)
-	else()
+		set_target_properties(openvizsla_static PROPERTIES
+			ARCHIVE_OUTPUT_NAME openvizsla)
+	endif()
+	target_compile_definitions(openvizsla_static PUBLIC "_XOPEN_SOURCE;_XOPEN_SOURCE_EXTENDED")
+	target_compile_definitions(openvizsla_static PRIVATE "OPENVIZSLA_STATIC_DEFINE")
+
+	if(WIN32)
 		target_sources(openvizsla PRIVATE ${WIN32_RESOURCE_FILE})
 		target_sources(openvizsla_static PUBLIC ${WIN32_RESOURCE_FILE})
+	elseif(APPLE)
+		set_target_properties(openvizsla PROPERTIES LINK_OPTIONS "${RESOURCE_LINK_OPTIONS}")
+		set_target_properties(openvizsla_static PROPERTIES INTERFACE_LINK_OPTIONS "${RESOURCE_LINK_OPTIONS}")
+	else()
+		target_sources(openvizsla_static PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/ov3.fwpkg.o)
 	endif()
 else()
 	add_library(openvizsla_static ALIAS openvizsla)
+	target_compile_definitions(openvizsla PRIVATE "OPENVIZSLA_STATIC_DEFINE")
 
 	if(WIN32)
 		target_sources(openvizsla PUBLIC ${WIN32_RESOURCE_FILE})
+	elseif(APPLE)
+		set_target_properties(openvizsla PROPERTIES INTERFACE_LINK_OPTIONS "${RESOURCE_LINK_OPTIONS}")
 	endif()
 endif()
 
@@ -122,17 +133,22 @@ foreach(test_source IN ITEMS ${TESTS})
 	string(REPLACE / _ test_name ${test_name})
 	string(REPLACE .c "" test_name ${test_name})
 	add_executable(${test_name} ${test_source})
-	target_link_libraries(${test_name} Check::check openvizsla_static)
+	target_link_libraries(${test_name} Check::checkShared openvizsla_static)
 	target_compile_definitions(${test_name} PRIVATE PROJECT_ROOT="${PROJECT_SOURCE_DIR}")
 	add_test(${test_name} ${test_name})
 endforeach(test_source)
 
 install(TARGETS openvizsla
-	DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR})
+	DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES "include/openvizsla.h"
-	DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR}/openvizsla)
+	DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/openvizsla)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/openvizsla_export.h"
-	DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR}/openvizsla)
+	DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/openvizsla)
 configure_file("openvizsla.pc.in" "openvizsla.pc" @ONLY)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/openvizsla.pc"
-	DESTINATION "${CMAKE_INSTALL_FULL_LIBDIR}/pkgconfig")
+	DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+
+if(WIN32)
+	set(CPACK_GENERATOR "ZIP")
+	include(CPack)
+endif()
